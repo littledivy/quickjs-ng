@@ -58,6 +58,7 @@ DEF(with, "with")
 /* FutureReservedWord */
 DEF(class, "class")
 DEF(const, "const")
+DEF(using, "using")
 DEF(enum, "enum")
 DEF(export, "export")
 DEF(extends, "extends")

@@ -483,6 +483,7 @@ typedef struct JSVarScope {
 typedef enum {
     /* XXX: add more variable kinds here instead of using bit fields */
     JS_VAR_NORMAL,
+    JS_VAR_SYNC_DISPOSE,
     JS_VAR_FUNCTION_DECL, /* lexical var with function declaration */
     JS_VAR_NEW_FUNCTION_DECL, /* lexical var with async/generator
                                  function declaration */
@@ -17732,6 +17733,7 @@ enum {
     /* FutureReservedWord */
     TOK_CLASS,
     TOK_CONST,
+    TOK_USING,
     TOK_ENUM,
     TOK_EXPORT,
     TOK_EXTENDS,
@@ -19728,6 +19730,7 @@ typedef enum {
     JS_VAR_DEF_NEW_FUNCTION_DECL, /* async/generator function declaration */
     JS_VAR_DEF_CATCH,
     JS_VAR_DEF_VAR,
+    JS_VAR_DEF_USING,
 } JSVarDefEnum;
 
 static int define_var(JSParseState *s, JSFunctionDef *fd, JSAtom name,
@@ -19744,6 +19747,7 @@ static int define_var(JSParseState *s, JSFunctionDef *fd, JSAtom name,
 
     case JS_VAR_DEF_LET:
     case JS_VAR_DEF_CONST:
+    case JS_VAR_DEF_USING:
     case JS_VAR_DEF_FUNCTION_DECL:
     case JS_VAR_DEF_NEW_FUNCTION_DECL:
         idx = find_lexical_decl(ctx, fd, name, fd->scope_first, TRUE);
@@ -19806,6 +19810,8 @@ static int define_var(JSParseState *s, JSFunctionDef *fd, JSAtom name,
                 var_kind = JS_VAR_FUNCTION_DECL;
             else if (var_def_type == JS_VAR_DEF_NEW_FUNCTION_DECL)
                 var_kind = JS_VAR_NEW_FUNCTION_DECL;
+            else if (var_def_type == JS_VAR_DEF_USING)
+                var_kind = JS_VAR_SYNC_DISPOSE;
             else
                 var_kind = JS_VAR_NORMAL;
             idx = add_scope_var(ctx, fd, name, var_kind);
@@ -21540,6 +21546,9 @@ static __exception int js_define_var(JSParseState *s, JSAtom name, int tok)
         break;
     case TOK_CONST:
         var_def_type = JS_VAR_DEF_CONST;
+        break;
+    case TOK_USING:
+        var_def_type = JS_VAR_DEF_USING;
         break;
     case TOK_VAR:
         var_def_type = JS_VAR_DEF_VAR;
@@ -24044,6 +24053,7 @@ static __exception int js_parse_statement_or_decl(JSParseState *s,
         break;
     case TOK_LET:
     case TOK_CONST:
+    case TOK_USING:
     haslet:
         if (!(decl_mask & DECL_MASK_OTHER)) {
             js_parse_error(s, "lexical declarations can't appear in single-statement context");
@@ -24212,7 +24222,7 @@ static __exception int js_parse_statement_or_decl(JSParseState *s,
                 default:
                     goto fail;
                 }
-                if (tok == TOK_VAR || tok == TOK_LET || tok == TOK_CONST) {
+                if (tok == TOK_VAR || tok == TOK_LET || tok == TOK_CONST || tok == TOK_USING) {
                     if (next_token(s))
                         goto fail;
                     if (js_parse_var(s, FALSE, tok, FALSE))
@@ -26273,6 +26283,7 @@ static __exception int js_parse_export(JSParseState *s)
     case TOK_VAR:
     case TOK_LET:
     case TOK_CONST:
+    case TOK_USING:
         return js_parse_var(s, TRUE, tok, TRUE);
     default:
         return js_parse_error(s, "invalid export syntax");
@@ -30419,6 +30430,7 @@ static __exception int js_parse_directives(JSParseState *s)
         case TOK_WITH:
         case TOK_CLASS:
         case TOK_CONST:
+        case TOK_USING:
         case TOK_ENUM:
         case TOK_EXPORT:
         case TOK_IMPORT:
