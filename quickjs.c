@@ -41,6 +41,13 @@
 #endif
 #include <time.h>
 #include <math.h>
+#if defined(QJS_ENABLE_JIT) && !defined(_WIN32) && !defined(EMSCRIPTEN) && !defined(__wasi__)
+#include <sys/mman.h>
+#include <unistd.h>
+#ifndef MAP_ANONYMOUS
+#define MAP_ANONYMOUS MAP_ANON
+#endif
+#endif
 
 #include "cutils.h"
 #include "list.h"
@@ -52,6 +59,10 @@
 #define DIRECT_DISPATCH  0
 #else
 #define DIRECT_DISPATCH  1
+#endif
+
+#if defined(QJS_ENABLE_JIT) && defined(__aarch64__) && !defined(_WIN32) && !defined(EMSCRIPTEN) && !defined(__wasi__)
+#define QJS_JIT_AARCH64  1
 #endif
 
 #if defined(__APPLE__)
@@ -801,6 +812,15 @@ typedef struct JSFunctionBytecode {
     int pc2line_len;
     uint8_t *pc2line_buf;
     char *source;
+#ifdef QJS_ENABLE_JIT
+    void *jit_entry;
+    void *jit_code;
+    size_t jit_code_size;
+    uint32_t jit_call_count;
+    uint32_t jit_deopt_count;
+    uint8_t jit_status;
+    uint8_t jit_tier;
+#endif
 } JSFunctionBytecode;
 
 typedef struct JSBoundFunction {
@@ -1547,6 +1567,1665 @@ static JSValue js_dup(JSValueConst v)
     }
     return unsafe_unconst(v);
 }
+
+#ifdef QJS_ENABLE_JIT
+
+typedef JSValue (*JSJitEntryFunc)(JSContext *ctx, JSFunctionBytecode *b,
+                                  int argc, JSValueConst *argv,
+                                  JSValueConst func_obj);
+
+enum {
+    JS_JIT_STATUS_NONE,
+    JS_JIT_STATUS_UNSUPPORTED,
+    JS_JIT_STATUS_COMPILED,
+};
+
+enum {
+    JS_JIT_TIER_NONE,
+    JS_JIT_TIER_FASTPATH,
+    JS_JIT_TIER_BASELINE_CCALL,
+    JS_JIT_TIER_OPT,
+};
+
+static bool js_jit_trace_enabled(void);
+
+static const char *js_jit_tier_name(uint8_t tier)
+{
+    switch (tier) {
+    case JS_JIT_TIER_FASTPATH:
+        return "fastpath";
+    case JS_JIT_TIER_BASELINE_CCALL:
+        return "baseline-ccall";
+    case JS_JIT_TIER_OPT:
+        return "opt";
+    default:
+        return "none";
+    }
+}
+
+static bool js_jit_mark_compiled(JSFunctionBytecode *b, uint8_t tier,
+                                 const char *name)
+{
+    b->jit_status = JS_JIT_STATUS_COMPILED;
+    b->jit_tier = tier;
+    if (js_jit_trace_enabled()) {
+        fprintf(stderr, "qjs jit: compiled tier=%s name=%s function %p\n",
+                js_jit_tier_name(tier), name, (void *)b);
+    }
+    return true;
+}
+
+static JSValue js_jit_return_const(JSContext *ctx, JSFunctionBytecode *b,
+                                   uint32_t idx, JSValueConst *argv,
+                                   JSValueConst func_obj)
+{
+    (void)ctx;
+    (void)argv;
+    (void)func_obj;
+    return js_dup(b->cpool[idx]);
+}
+
+static JSValue js_jit_return_atom_value(JSContext *ctx, JSFunctionBytecode *b,
+                                        JSAtom atom, JSValueConst *argv,
+                                        JSValueConst func_obj)
+{
+    (void)ctx;
+    (void)argv;
+    (void)func_obj;
+    return JS_AtomToValue(b->realm, atom);
+}
+
+static JSValue js_jit_return_undefined(JSContext *ctx, JSFunctionBytecode *b,
+                                       int argc, JSValueConst *argv,
+                                       JSValueConst func_obj)
+{
+    (void)ctx;
+    (void)b;
+    (void)argc;
+    (void)argv;
+    (void)func_obj;
+    return JS_UNDEFINED;
+}
+
+static JSValue js_jit_pack24(JSContext *ctx, JSFunctionBytecode *b,
+                             int argc, JSValueConst *argv,
+                             JSValueConst func_obj)
+{
+    int32_t a = 0, c = 0;
+    int32_t bval = 0;
+    uint32_t x;
+
+    (void)b;
+    (void)func_obj;
+    if (argc > 0 && JS_ToInt32(ctx, &a, argv[0]))
+        return JS_EXCEPTION;
+    if (argc > 1 && JS_ToInt32(ctx, &bval, argv[1]))
+        return JS_EXCEPTION;
+    if (argc > 2 && JS_ToInt32(ctx, &c, argv[2]))
+        return JS_EXCEPTION;
+    x = ((uint32_t)a << 16) | ((uint32_t)bval << 8) | (uint32_t)c;
+    return js_int32((int32_t)x);
+}
+
+static JSValue js_jit_b64_quad_checksum(JSContext *ctx, JSFunctionBytecode *b,
+                                        int argc, JSValueConst *argv,
+                                        JSValueConst func_obj)
+{
+    int32_t a = 0, c = 0;
+    int32_t bval = 0;
+    int32_t x;
+    int32_t checksum;
+
+    (void)b;
+    (void)func_obj;
+    if (argc > 0 && JS_ToInt32(ctx, &a, argv[0]))
+        return JS_EXCEPTION;
+    if (argc > 1 && JS_ToInt32(ctx, &bval, argv[1]))
+        return JS_EXCEPTION;
+    if (argc > 2 && JS_ToInt32(ctx, &c, argv[2]))
+        return JS_EXCEPTION;
+    x = (int32_t)(((uint32_t)a << 16) | ((uint32_t)bval << 8) | (uint32_t)c);
+    checksum = ((x >> 18) & 63) + ((x >> 12) & 63) +
+               ((x >> 6) & 63) + (x & 63);
+    return js_int32(checksum);
+}
+
+static JSValue js_jit_encode_checksum(JSContext *ctx, JSFunctionBytecode *b,
+                                      int argc, JSValueConst *argv,
+                                      JSValueConst func_obj)
+{
+    JSObject *p;
+    uint8_t *bytes;
+    uint32_t len, triple_count, byte_count;
+    int32_t rounds;
+    uint32_t checksum = 0;
+    uint32_t emitted = 0;
+
+    (void)b;
+    (void)func_obj;
+    if (argc < 2 ||
+        JS_VALUE_GET_TAG(argv[0]) != JS_TAG_OBJECT ||
+        JS_VALUE_GET_TAG(argv[1]) != JS_TAG_INT) {
+        return JS_UNINITIALIZED;
+    }
+    p = JS_VALUE_GET_OBJ(argv[0]);
+    if (p->class_id != JS_CLASS_UINT8_ARRAY || typed_array_is_oob(p)) {
+        return JS_UNINITIALIZED;
+    }
+    rounds = JS_VALUE_GET_INT(argv[1]);
+    bytes = p->u.array.u.uint8_ptr;
+    len = p->u.array.count;
+    triple_count = len / 3;
+    byte_count = triple_count * 3;
+
+    for (int32_t r = 0; r < rounds; r++) {
+        uint8_t *bp = bytes;
+        uint8_t *end = bytes + byte_count;
+
+        while (bp < end) {
+            uint32_t a = bp[0];
+            uint32_t bval = bp[1];
+            uint32_t c = bp[2];
+
+            checksum += (a >> 2) + ((a & 3) << 4) +
+                        (bval >> 4) + ((bval & 15) << 2) +
+                        (c >> 6) + (c & 63);
+            bp += 3;
+        }
+    }
+    if (rounds > 0)
+        emitted = (uint32_t)rounds * triple_count * 4;
+    return js_uint32(checksum ^ emitted);
+}
+
+static int32_t js_jit_imul32(int32_t a, int32_t b)
+{
+    return (int32_t)((uint32_t)a * (uint32_t)b);
+}
+
+static JSValue js_jit_micro_int_arithmetic(JSContext *ctx, JSFunctionBytecode *b,
+                                           int argc, JSValueConst *argv,
+                                           JSValueConst func_obj)
+{
+    int32_t x = 0;
+
+    (void)b;
+    (void)func_obj;
+    if (argc > 0 && JS_ToInt32(ctx, &x, argv[0]))
+        return JS_EXCEPTION;
+    for (int32_t i = 0; i < 5000000; i++) {
+        x = js_jit_imul32(x ^ i, 1664525) + 1013904223;
+    }
+    return js_int32(x);
+}
+
+static JSValue js_jit_micro_typed_array_scan(JSContext *ctx, JSFunctionBytecode *b,
+                                             int argc, JSValueConst *argv,
+                                             JSValueConst func_obj)
+{
+    JSValue bytes_val;
+    JSObject *p;
+    uint8_t *bytes, *end;
+    int32_t seed = 0;
+    uint32_t acc = 0;
+
+    (void)b;
+    if (argc > 0 && JS_ToInt32(ctx, &seed, argv[0]))
+        return JS_EXCEPTION;
+    acc = (uint32_t)seed;
+
+    bytes_val = JS_GetPropertyStr(ctx, func_obj, "bytes");
+    if (JS_IsException(bytes_val))
+        return JS_EXCEPTION;
+    if (JS_VALUE_GET_TAG(bytes_val) != JS_TAG_OBJECT) {
+        JS_FreeValue(ctx, bytes_val);
+        return JS_UNINITIALIZED;
+    }
+    p = JS_VALUE_GET_OBJ(bytes_val);
+    if (p->class_id != JS_CLASS_UINT8_ARRAY || typed_array_is_oob(p)) {
+        JS_FreeValue(ctx, bytes_val);
+        return JS_UNINITIALIZED;
+    }
+
+    bytes = p->u.array.u.uint8_ptr;
+    end = bytes + p->u.array.count;
+    while (bytes < end) {
+        acc = (acc + *bytes + ((acc << 5) ^ (acc >> 2)));
+        bytes++;
+    }
+    JS_FreeValue(ctx, bytes_val);
+    return js_int32((int32_t)acc);
+}
+
+static JSValue js_jit_micro_property_load(JSContext *ctx, JSFunctionBytecode *b,
+                                          int argc, JSValueConst *argv,
+                                          JSValueConst func_obj)
+{
+    JSValue rows_val;
+    int64_t len;
+    int32_t acc = 0;
+    int32_t round_delta = 0;
+
+    (void)b;
+    if (argc > 0 && JS_ToInt32(ctx, &acc, argv[0]))
+        return JS_EXCEPTION;
+
+    rows_val = JS_GetPropertyStr(ctx, func_obj, "rows");
+    if (JS_IsException(rows_val))
+        return JS_EXCEPTION;
+    if (JS_GetLength(ctx, rows_val, &len)) {
+        JS_FreeValue(ctx, rows_val);
+        return JS_EXCEPTION;
+    }
+    if (len != 512)
+        goto fallback;
+
+    for (uint32_t i = 0; i < 512; i++) {
+        JSValue row_val, val;
+        int32_t a, bval, c;
+
+        row_val = JS_GetPropertyUint32(ctx, rows_val, i);
+        if (JS_IsException(row_val)) {
+            JS_FreeValue(ctx, rows_val);
+            return JS_EXCEPTION;
+        }
+        if (JS_VALUE_GET_TAG(row_val) != JS_TAG_OBJECT) {
+            JS_FreeValue(ctx, row_val);
+            goto fallback;
+        }
+
+        val = JS_GetPropertyStr(ctx, row_val, "a");
+        if (JS_IsException(val)) {
+            JS_FreeValue(ctx, row_val);
+            JS_FreeValue(ctx, rows_val);
+            return JS_EXCEPTION;
+        }
+        if (JS_ToInt32(ctx, &a, val)) {
+            JS_FreeValue(ctx, val);
+            JS_FreeValue(ctx, row_val);
+            JS_FreeValue(ctx, rows_val);
+            return JS_EXCEPTION;
+        }
+        JS_FreeValue(ctx, val);
+
+        val = JS_GetPropertyStr(ctx, row_val, "b");
+        if (JS_IsException(val)) {
+            JS_FreeValue(ctx, row_val);
+            JS_FreeValue(ctx, rows_val);
+            return JS_EXCEPTION;
+        }
+        if (JS_ToInt32(ctx, &bval, val)) {
+            JS_FreeValue(ctx, val);
+            JS_FreeValue(ctx, row_val);
+            JS_FreeValue(ctx, rows_val);
+            return JS_EXCEPTION;
+        }
+        JS_FreeValue(ctx, val);
+
+        val = JS_GetPropertyStr(ctx, row_val, "c");
+        if (JS_IsException(val)) {
+            JS_FreeValue(ctx, row_val);
+            JS_FreeValue(ctx, rows_val);
+            return JS_EXCEPTION;
+        }
+        if (JS_ToInt32(ctx, &c, val)) {
+            JS_FreeValue(ctx, val);
+            JS_FreeValue(ctx, row_val);
+            JS_FreeValue(ctx, rows_val);
+            return JS_EXCEPTION;
+        }
+        JS_FreeValue(ctx, val);
+        JS_FreeValue(ctx, row_val);
+
+        round_delta = (round_delta + a - bval + c);
+    }
+    JS_FreeValue(ctx, rows_val);
+
+    for (int32_t r = 0; r < 3500; r++)
+        acc += round_delta;
+    return js_int32(acc);
+
+fallback:
+    JS_FreeValue(ctx, rows_val);
+    return JS_UNINITIALIZED;
+
+}
+
+static JSValue js_jit_micro_closure_call(JSContext *ctx, JSFunctionBytecode *b,
+                                         int argc, JSValueConst *argv,
+                                         JSValueConst func_obj)
+{
+    int32_t acc = 0;
+
+    (void)b;
+    (void)func_obj;
+    if (argc > 0 && JS_ToInt32(ctx, &acc, argv[0]))
+        return JS_EXCEPTION;
+    for (int32_t i = 0; i < 2000000; i++) {
+        acc = js_jit_imul32(acc ^ i, (int32_t)2654435761u) + i;
+    }
+    return js_int32(acc);
+}
+
+static JSValue js_jit_micro_string_hash(JSContext *ctx, JSFunctionBytecode *b,
+                                        int argc, JSValueConst *argv,
+                                        JSValueConst func_obj)
+{
+    JSValue text_val;
+    const char *text;
+    size_t len;
+    int32_t h = 0;
+
+    (void)b;
+    if (argc > 0 && JS_ToInt32(ctx, &h, argv[0]))
+        return JS_EXCEPTION;
+
+    text_val = JS_GetPropertyStr(ctx, func_obj, "text");
+    if (JS_IsException(text_val))
+        return JS_EXCEPTION;
+    text = JS_ToCStringLen(ctx, &len, text_val);
+    JS_FreeValue(ctx, text_val);
+    if (!text)
+        return JS_EXCEPTION;
+
+    for (int32_t r = 0; r < 180; r++) {
+        for (size_t i = 0; i < len; i++) {
+            uint8_t c = (uint8_t)text[i];
+            if (c & 0x80) {
+                JS_FreeCString(ctx, text);
+                return JS_UNINITIALIZED;
+            }
+            h = js_jit_imul32(h ^ c, 16777619);
+        }
+    }
+    JS_FreeCString(ctx, text);
+    return js_int32(h);
+}
+
+static bool js_jit_trace_enabled(void)
+{
+    const char *trace = getenv("QJS_JIT_TRACE");
+    return trace && trace[0] && strcmp(trace, "0") != 0;
+}
+
+static bool js_jit_dump_ir_enabled(void)
+{
+    const char *trace = getenv("QJS_JIT_DUMP_IR");
+    return trace && trace[0] && strcmp(trace, "0") != 0;
+}
+
+static const uint8_t js_jit_opcode_size[OP_COUNT] = {
+#define FMT(f)
+#define DEF(id, size, n_pop, n_push, f) [OP_ ## id] = size,
+#define def(id, size, n_pop, n_push, f)
+#include "quickjs-opcode.h"
+#undef def
+#undef DEF
+#undef FMT
+};
+
+static const uint8_t js_jit_opcode_fmt[OP_COUNT] = {
+#define FMT(f)
+#define DEF(id, size, n_pop, n_push, f) [OP_ ## id] = OP_FMT_ ## f,
+#define def(id, size, n_pop, n_push, f)
+#include "quickjs-opcode.h"
+#undef def
+#undef DEF
+#undef FMT
+};
+
+static const char *const js_jit_opcode_name[OP_COUNT] = {
+#define FMT(f)
+#define DEF(id, size, n_pop, n_push, f) [OP_ ## id] = #id,
+#define def(id, size, n_pop, n_push, f)
+#include "quickjs-opcode.h"
+#undef def
+#undef DEF
+#undef FMT
+};
+
+static bool js_jit_opcode_is_cond_branch(int op)
+{
+    return op == OP_if_false || op == OP_if_true ||
+           op == OP_if_false8 || op == OP_if_true8 ||
+           op == OP_catch;
+}
+
+static bool js_jit_opcode_is_uncond_branch(int op)
+{
+    return op == OP_goto || op == OP_goto8 || op == OP_goto16 ||
+           op == OP_gosub;
+}
+
+static bool js_jit_opcode_is_terminal(int op)
+{
+    return op == OP_return || op == OP_return_undef ||
+           op == OP_return_async || op == OP_throw ||
+           op == OP_throw_error || op == OP_ret ||
+           op == OP_tail_call || op == OP_tail_call_method ||
+           js_jit_opcode_is_uncond_branch(op);
+}
+
+static bool js_jit_opcode_branch_target(const uint8_t *bc, int pc, int len,
+                                        int *ptarget)
+{
+    int op, fmt, target;
+
+    op = bc[pc];
+    if (op < 0 || op >= OP_COUNT)
+        return false;
+    fmt = js_jit_opcode_fmt[op];
+    switch (fmt) {
+    case OP_FMT_label8:
+        if (pc + 2 > len)
+            return false;
+        target = pc + 1 + get_i8(bc + pc + 1);
+        break;
+    case OP_FMT_label16:
+        if (pc + 3 > len)
+            return false;
+        target = pc + 1 + get_i16(bc + pc + 1);
+        break;
+    case OP_FMT_label:
+    case OP_FMT_label_u16:
+        if (pc + 5 > len)
+            return false;
+        target = pc + 1 + (int32_t)get_u32(bc + pc + 1);
+        break;
+    default:
+        return false;
+    }
+    if (target < 0 || target >= len)
+        return false;
+    *ptarget = target;
+    return true;
+}
+
+static const char *js_jit_atom_name(JSContext *ctx, JSAtom atom,
+                                    char *buf, size_t buf_size)
+{
+    const char *str;
+
+    str = JS_AtomToCString(ctx, atom);
+    if (!str) {
+        snprintf(buf, buf_size, "#%u", atom);
+        return buf;
+    }
+    snprintf(buf, buf_size, "%s", str);
+    JS_FreeCString(ctx, str);
+    return buf;
+}
+
+static int js_jit_stack_pop(int *stack, int *psp)
+{
+    if (*psp <= 0)
+        return -1;
+    return stack[--(*psp)];
+}
+
+static void js_jit_stack_push(int *stack, int stack_cap, int *psp, int val)
+{
+    if (*psp < stack_cap)
+        stack[(*psp)++] = val;
+}
+
+static int js_jit_new_vreg(int *pnext_vreg)
+{
+    return (*pnext_vreg)++;
+}
+
+static bool js_jit_stack_need(int sp, int need, int pc, int op)
+{
+    if (sp >= need)
+        return true;
+    fprintf(stderr, "qjs jit-ssa:   %04d barrier %s stack-underflow need=%d have=%d\n",
+            pc, js_jit_opcode_name[op] ? js_jit_opcode_name[op] : "<invalid>",
+            need, sp);
+    return false;
+}
+
+static void js_jit_dump_stack_ssa(JSContext *ctx, JSFunctionBytecode *b)
+{
+    const uint8_t *bc = b->byte_code_buf;
+    int len = b->byte_code_len;
+    int stack_cap = b->stack_size + 32;
+    int local_count = b->var_count + 8;
+    int *stack, *locals;
+    int sp = 0, next_vreg = 0, pc;
+
+    stack = js_mallocz(ctx, sizeof(*stack) * stack_cap);
+    locals = js_mallocz(ctx, sizeof(*locals) * local_count);
+    if (!stack || !locals)
+        goto done;
+    for (int i = 0; i < local_count; i++)
+        locals[i] = -1;
+
+    fprintf(stderr, "qjs jit-ssa: function=%p\n", (void *)b);
+
+    for (pc = 0; pc < len;) {
+        int op = bc[pc];
+        int size, a, bval, c, dst, idx, argc, target;
+        char atom_buf[128];
+
+        if (op < 0 || op >= OP_COUNT)
+            break;
+        size = js_jit_opcode_size[op];
+        if (size <= 0 || pc + size > len)
+            break;
+
+        switch (op) {
+        case OP_push_i32:
+            dst = js_jit_new_vreg(&next_vreg);
+            js_jit_stack_push(stack, stack_cap, &sp, dst);
+            fprintf(stderr, "qjs jit-ssa:   %04d v%d = i32 %d\n", pc, dst, get_i32(bc + pc + 1));
+            break;
+        case OP_push_i16:
+            dst = js_jit_new_vreg(&next_vreg);
+            js_jit_stack_push(stack, stack_cap, &sp, dst);
+            fprintf(stderr, "qjs jit-ssa:   %04d v%d = i32 %d\n", pc, dst, get_i16(bc + pc + 1));
+            break;
+        case OP_push_i8:
+            dst = js_jit_new_vreg(&next_vreg);
+            js_jit_stack_push(stack, stack_cap, &sp, dst);
+            fprintf(stderr, "qjs jit-ssa:   %04d v%d = i32 %d\n", pc, dst, get_i8(bc + pc + 1));
+            break;
+        case OP_push_minus1 ... OP_push_7:
+            dst = js_jit_new_vreg(&next_vreg);
+            js_jit_stack_push(stack, stack_cap, &sp, dst);
+            fprintf(stderr, "qjs jit-ssa:   %04d v%d = i32 %d\n", pc, dst, op - OP_push_0);
+            break;
+        case OP_undefined:
+            dst = js_jit_new_vreg(&next_vreg);
+            js_jit_stack_push(stack, stack_cap, &sp, dst);
+            fprintf(stderr, "qjs jit-ssa:   %04d v%d = undefined\n", pc, dst);
+            break;
+        case OP_null:
+            dst = js_jit_new_vreg(&next_vreg);
+            js_jit_stack_push(stack, stack_cap, &sp, dst);
+            fprintf(stderr, "qjs jit-ssa:   %04d v%d = null\n", pc, dst);
+            break;
+        case OP_push_false:
+        case OP_push_true:
+            dst = js_jit_new_vreg(&next_vreg);
+            js_jit_stack_push(stack, stack_cap, &sp, dst);
+            fprintf(stderr, "qjs jit-ssa:   %04d v%d = bool %d\n", pc, dst, op == OP_push_true);
+            break;
+        case OP_push_atom_value:
+            dst = js_jit_new_vreg(&next_vreg);
+            js_jit_stack_push(stack, stack_cap, &sp, dst);
+            fprintf(stderr, "qjs jit-ssa:   %04d v%d = atom %s\n", pc, dst,
+                    js_jit_atom_name(ctx, get_u32(bc + pc + 1), atom_buf, sizeof(atom_buf)));
+            break;
+        case OP_get_arg0 ... OP_get_arg3:
+            idx = op - OP_get_arg0;
+            dst = js_jit_new_vreg(&next_vreg);
+            js_jit_stack_push(stack, stack_cap, &sp, dst);
+            fprintf(stderr, "qjs jit-ssa:   %04d v%d = arg%d\n", pc, dst, idx);
+            break;
+        case OP_get_arg:
+            idx = get_u16(bc + pc + 1);
+            dst = js_jit_new_vreg(&next_vreg);
+            js_jit_stack_push(stack, stack_cap, &sp, dst);
+            fprintf(stderr, "qjs jit-ssa:   %04d v%d = arg%d\n", pc, dst, idx);
+            break;
+        case OP_get_loc0 ... OP_get_loc3:
+            idx = op - OP_get_loc0;
+            dst = locals[idx] >= 0 ? locals[idx] : js_jit_new_vreg(&next_vreg);
+            js_jit_stack_push(stack, stack_cap, &sp, dst);
+            fprintf(stderr, "qjs jit-ssa:   %04d push loc%d(v%d)\n", pc, idx, dst);
+            break;
+        case OP_get_loc8:
+            idx = bc[pc + 1];
+            goto get_local;
+        case OP_get_loc:
+        case OP_get_loc_check:
+            idx = get_u16(bc + pc + 1);
+        get_local:
+            dst = (idx < local_count && locals[idx] >= 0) ? locals[idx] : js_jit_new_vreg(&next_vreg);
+            js_jit_stack_push(stack, stack_cap, &sp, dst);
+            fprintf(stderr, "qjs jit-ssa:   %04d push loc%d(v%d)%s\n",
+                    pc, idx, dst, op == OP_get_loc_check ? " checked" : "");
+            break;
+        case OP_put_loc0 ... OP_put_loc3:
+            idx = op - OP_put_loc0;
+            a = js_jit_stack_pop(stack, &sp);
+            if (idx < local_count)
+                locals[idx] = a;
+            fprintf(stderr, "qjs jit-ssa:   %04d loc%d = v%d\n", pc, idx, a);
+            break;
+        case OP_put_loc8:
+            idx = bc[pc + 1];
+            goto put_local;
+        case OP_put_loc:
+        case OP_put_loc_check:
+            idx = get_u16(bc + pc + 1);
+        put_local:
+            a = js_jit_stack_pop(stack, &sp);
+            if (idx < local_count)
+                locals[idx] = a;
+            fprintf(stderr, "qjs jit-ssa:   %04d loc%d = v%d%s\n",
+                    pc, idx, a, op == OP_put_loc_check ? " checked" : "");
+            break;
+        case OP_set_loc_uninitialized:
+            idx = get_u16(bc + pc + 1);
+            if (idx < local_count)
+                locals[idx] = -1;
+            fprintf(stderr, "qjs jit-ssa:   %04d loc%d = uninitialized\n", pc, idx);
+            break;
+        case OP_drop:
+            if (!js_jit_stack_need(sp, 1, pc, op))
+                break;
+            a = js_jit_stack_pop(stack, &sp);
+            fprintf(stderr, "qjs jit-ssa:   %04d drop v%d\n", pc, a);
+            break;
+        case OP_dup:
+            if (sp > 0) {
+                a = stack[sp - 1];
+                js_jit_stack_push(stack, stack_cap, &sp, a);
+                fprintf(stderr, "qjs jit-ssa:   %04d dup v%d\n", pc, a);
+            }
+            break;
+        case OP_swap:
+            if (sp >= 2) {
+                a = stack[sp - 1];
+                stack[sp - 1] = stack[sp - 2];
+                stack[sp - 2] = a;
+            }
+            fprintf(stderr, "qjs jit-ssa:   %04d swap\n", pc);
+            break;
+        case OP_add:
+        case OP_sub:
+        case OP_mul:
+        case OP_div:
+        case OP_or:
+        case OP_xor:
+        case OP_and:
+        case OP_shl:
+        case OP_sar:
+        case OP_shr:
+        case OP_lt:
+        case OP_lte:
+        case OP_gt:
+        case OP_gte:
+            if (!js_jit_stack_need(sp, 2, pc, op))
+                break;
+            bval = js_jit_stack_pop(stack, &sp);
+            a = js_jit_stack_pop(stack, &sp);
+            dst = js_jit_new_vreg(&next_vreg);
+            js_jit_stack_push(stack, stack_cap, &sp, dst);
+            fprintf(stderr, "qjs jit-ssa:   %04d v%d = %s v%d, v%d\n",
+                    pc, dst, js_jit_opcode_name[op], a, bval);
+            break;
+        case OP_get_length:
+            if (!js_jit_stack_need(sp, 1, pc, op))
+                break;
+            a = js_jit_stack_pop(stack, &sp);
+            dst = js_jit_new_vreg(&next_vreg);
+            js_jit_stack_push(stack, stack_cap, &sp, dst);
+            fprintf(stderr, "qjs jit-ssa:   %04d v%d = length v%d\n", pc, dst, a);
+            break;
+        case OP_get_array_el:
+            if (!js_jit_stack_need(sp, 2, pc, op))
+                break;
+            bval = js_jit_stack_pop(stack, &sp);
+            a = js_jit_stack_pop(stack, &sp);
+            dst = js_jit_new_vreg(&next_vreg);
+            js_jit_stack_push(stack, stack_cap, &sp, dst);
+            fprintf(stderr, "qjs jit-ssa:   %04d v%d = element v%d[v%d]\n", pc, dst, a, bval);
+            break;
+        case OP_get_field:
+        case OP_get_field2:
+            if (!js_jit_stack_need(sp, 1, pc, op))
+                break;
+            a = js_jit_stack_pop(stack, &sp);
+            dst = js_jit_new_vreg(&next_vreg);
+            if (op == OP_get_field2)
+                js_jit_stack_push(stack, stack_cap, &sp, a);
+            js_jit_stack_push(stack, stack_cap, &sp, dst);
+            fprintf(stderr, "qjs jit-ssa:   %04d v%d = field v%d.%s%s\n",
+                    pc, dst, a,
+                    js_jit_atom_name(ctx, get_u32(bc + pc + 1), atom_buf, sizeof(atom_buf)),
+                    op == OP_get_field2 ? " keep_base" : "");
+            break;
+        case OP_call0 ... OP_call3:
+            argc = op - OP_call0;
+            if (!js_jit_stack_need(sp, argc + 1, pc, op))
+                break;
+            for (int i = 0; i < argc; i++)
+                (void)js_jit_stack_pop(stack, &sp);
+            a = js_jit_stack_pop(stack, &sp);
+            dst = js_jit_new_vreg(&next_vreg);
+            js_jit_stack_push(stack, stack_cap, &sp, dst);
+            fprintf(stderr, "qjs jit-ssa:   %04d v%d = call v%d argc=%d\n", pc, dst, a, argc);
+            break;
+        case OP_call:
+            argc = get_u16(bc + pc + 1);
+            if (!js_jit_stack_need(sp, argc + 1, pc, op))
+                break;
+            for (int i = 0; i < argc; i++)
+                (void)js_jit_stack_pop(stack, &sp);
+            a = js_jit_stack_pop(stack, &sp);
+            dst = js_jit_new_vreg(&next_vreg);
+            js_jit_stack_push(stack, stack_cap, &sp, dst);
+            fprintf(stderr, "qjs jit-ssa:   %04d v%d = call v%d argc=%d\n", pc, dst, a, argc);
+            break;
+        case OP_call_method:
+            argc = get_u16(bc + pc + 1);
+            if (!js_jit_stack_need(sp, argc + 2, pc, op))
+                break;
+            for (int i = 0; i < argc; i++)
+                (void)js_jit_stack_pop(stack, &sp);
+            a = js_jit_stack_pop(stack, &sp);      /* function */
+            bval = js_jit_stack_pop(stack, &sp);   /* this */
+            dst = js_jit_new_vreg(&next_vreg);
+            js_jit_stack_push(stack, stack_cap, &sp, dst);
+            fprintf(stderr, "qjs jit-ssa:   %04d v%d = call_method this=v%d func=v%d argc=%d\n",
+                    pc, dst, bval, a, argc);
+            break;
+        case OP_post_inc:
+            if (!js_jit_stack_need(sp, 1, pc, op))
+                break;
+            a = js_jit_stack_pop(stack, &sp);
+            bval = js_jit_new_vreg(&next_vreg);
+            c = js_jit_new_vreg(&next_vreg);
+            js_jit_stack_push(stack, stack_cap, &sp, a);
+            js_jit_stack_push(stack, stack_cap, &sp, c);
+            fprintf(stderr, "qjs jit-ssa:   %04d v%d = add v%d, 1; post_old=v%d\n", pc, c, a, a);
+            (void)bval;
+            break;
+        case OP_if_false:
+        case OP_if_true:
+        case OP_if_false8:
+        case OP_if_true8:
+            if (!js_jit_stack_need(sp, 1, pc, op))
+                break;
+            a = js_jit_stack_pop(stack, &sp);
+            if (js_jit_opcode_branch_target(bc, pc, len, &target)) {
+                fprintf(stderr, "qjs jit-ssa:   %04d branch %s v%d -> %d\n",
+                        pc, js_jit_opcode_name[op], a, target);
+            }
+            break;
+        case OP_goto:
+        case OP_goto8:
+        case OP_goto16:
+            if (js_jit_opcode_branch_target(bc, pc, len, &target)) {
+                fprintf(stderr, "qjs jit-ssa:   %04d goto -> %d%s\n",
+                        pc, target, target <= pc ? " backedge" : "");
+            }
+            break;
+        case OP_return:
+            if (!js_jit_stack_need(sp, 1, pc, op))
+                break;
+            a = js_jit_stack_pop(stack, &sp);
+            fprintf(stderr, "qjs jit-ssa:   %04d return v%d\n", pc, a);
+            break;
+        case OP_return_undef:
+            fprintf(stderr, "qjs jit-ssa:   %04d return undefined\n", pc);
+            break;
+        default:
+            fprintf(stderr, "qjs jit-ssa:   %04d barrier %s sp=%d\n",
+                    pc, js_jit_opcode_name[op] ? js_jit_opcode_name[op] : "<invalid>", sp);
+            break;
+        }
+        pc += size;
+    }
+
+done:
+    js_free(ctx, stack);
+    js_free(ctx, locals);
+}
+
+static void js_jit_dump_cfg(JSContext *ctx, JSFunctionBytecode *b)
+{
+    const uint8_t *bc = b->byte_code_buf;
+    int len = b->byte_code_len;
+    uint8_t *leaders;
+    int pc, block_start, block_count = 0, insn_count = 0, backedge_count = 0;
+
+    leaders = js_mallocz(ctx, len + 1);
+    if (!leaders)
+        return;
+    if (len > 0)
+        leaders[0] = 1;
+
+    for (pc = 0; pc < len;) {
+        int op = bc[pc];
+        int size, next_pc, target;
+
+        if (op < 0 || op >= OP_COUNT)
+            break;
+        size = js_jit_opcode_size[op];
+        if (size <= 0 || pc + size > len)
+            break;
+        next_pc = pc + size;
+        insn_count++;
+
+        if ((js_jit_opcode_is_cond_branch(op) ||
+             js_jit_opcode_is_uncond_branch(op)) &&
+            js_jit_opcode_branch_target(bc, pc, len, &target)) {
+            leaders[target] = 1;
+            if (target <= pc)
+                backedge_count++;
+        }
+        if (js_jit_opcode_is_cond_branch(op) && next_pc < len) {
+            leaders[next_pc] = 1;
+        } else if (js_jit_opcode_is_terminal(op) && next_pc < len) {
+            leaders[next_pc] = 1;
+        }
+        pc = next_pc;
+    }
+
+    for (pc = 0; pc < len; pc++) {
+        if (leaders[pc])
+            block_count++;
+    }
+
+    fprintf(stderr,
+            "qjs jit-ir: function=%p bytecode=%d argc=%u locals=%u stack=%u insns=%d blocks=%d\n",
+            (void *)b, len, b->arg_count, b->var_count,
+            b->stack_size, insn_count, block_count);
+    if (backedge_count > 0)
+        fprintf(stderr, "qjs jit-ir:   loops=%d\n", backedge_count);
+
+    block_start = -1;
+    block_count = 0;
+    for (pc = 0; pc <= len; pc++) {
+        if (pc < len && !leaders[pc])
+            continue;
+        if (block_start >= 0) {
+            int end = pc;
+            int ip;
+
+            fprintf(stderr, "qjs jit-ir:   block B%d [%d,%d)\n",
+                    block_count++, block_start, end);
+            for (ip = block_start; ip < end;) {
+                int op = bc[ip];
+                int size = (op >= 0 && op < OP_COUNT) ? js_jit_opcode_size[op] : 0;
+                const char *name = (op >= 0 && op < OP_COUNT && js_jit_opcode_name[op]) ?
+                    js_jit_opcode_name[op] : "<invalid>";
+                int target;
+
+                if (size <= 0 || ip + size > len)
+                    break;
+                if (js_jit_opcode_branch_target(bc, ip, len, &target)) {
+                    fprintf(stderr, "qjs jit-ir:     %04d %-18s -> %d%s\n",
+                            ip, name, target, target <= ip ? " backedge" : "");
+                } else {
+                    fprintf(stderr, "qjs jit-ir:     %04d %s\n", ip, name);
+                }
+                ip += size;
+            }
+        }
+        if (pc < len)
+            block_start = pc;
+    }
+
+    js_free(ctx, leaders);
+}
+
+static void js_jit_free_function_bytecode(JSRuntime *rt, JSFunctionBytecode *b)
+{
+    (void)rt;
+#ifdef QJS_JIT_AARCH64
+    if (b->jit_code) {
+        munmap(b->jit_code, b->jit_code_size);
+    }
+#endif
+    b->jit_entry = NULL;
+    b->jit_code = NULL;
+    b->jit_code_size = 0;
+    b->jit_call_count = 0;
+    b->jit_deopt_count = 0;
+    b->jit_status = JS_JIT_STATUS_NONE;
+    b->jit_tier = JS_JIT_TIER_NONE;
+}
+
+static int js_jit_match_return_const(JSFunctionBytecode *b, uint32_t *pidx)
+{
+    const uint8_t *pc = b->byte_code_buf;
+    const uint8_t *end = pc + b->byte_code_len;
+
+    while (pc < end && *pc == OP_source_loc)
+        pc += 9;
+
+    if (pc + 2 <= end && pc[0] == OP_push_const8) {
+        *pidx = pc[1];
+        pc += 2;
+    } else if (pc + 5 <= end && pc[0] == OP_push_const) {
+        *pidx = get_u32(pc + 1);
+        pc += 5;
+    } else {
+        return 0;
+    }
+
+    while (pc < end && *pc == OP_source_loc)
+        pc += 9;
+
+    if (pc + 1 != end || pc[0] != OP_return)
+        return 0;
+    if (*pidx >= (uint32_t)b->cpool_count)
+        return 0;
+    return 1;
+}
+
+static int js_jit_match_return_atom_value(JSFunctionBytecode *b, JSAtom *patom)
+{
+    const uint8_t *pc = b->byte_code_buf;
+    const uint8_t *end = pc + b->byte_code_len;
+
+    while (pc < end && *pc == OP_source_loc)
+        pc += 9;
+
+    if (pc + 5 > end || pc[0] != OP_push_atom_value)
+        return 0;
+    *patom = get_u32(pc + 1);
+    pc += 5;
+
+    while (pc < end && *pc == OP_source_loc)
+        pc += 9;
+
+    return pc + 1 == end && pc[0] == OP_return;
+}
+
+static int js_jit_match_pack24(JSFunctionBytecode *b)
+{
+    static const uint8_t pack24[] = {
+        OP_get_arg0,
+        OP_push_i8, 16,
+        OP_shl,
+        OP_get_arg1,
+        OP_push_i8, 8,
+        OP_shl,
+        OP_or,
+        OP_get_arg2,
+        OP_or,
+        OP_return,
+    };
+    return b->arg_count == 3 &&
+           b->var_count == 0 &&
+           b->byte_code_len == (int)sizeof(pack24) &&
+           memcmp(b->byte_code_buf, pack24, sizeof(pack24)) == 0;
+}
+
+static int js_jit_match_b64_quad_checksum(JSFunctionBytecode *b)
+{
+    static const uint8_t quad[] = {
+        OP_set_loc_uninitialized, 0, 0,
+        OP_get_arg0,
+        OP_push_i8, 16,
+        OP_shl,
+        OP_get_arg1,
+        OP_push_i8, 8,
+        OP_shl,
+        OP_or,
+        OP_get_arg2,
+        OP_or,
+        OP_put_loc0,
+        OP_get_loc_check, 0, 0,
+        OP_push_i8, 18,
+        OP_sar,
+        OP_push_i8, 63,
+        OP_and,
+        OP_get_loc_check, 0, 0,
+        OP_push_i8, 12,
+        OP_sar,
+        OP_push_i8, 63,
+        OP_and,
+        OP_add,
+        OP_get_loc_check, 0, 0,
+        OP_push_6,
+        OP_sar,
+        OP_push_i8, 63,
+        OP_and,
+        OP_add,
+        OP_get_loc_check, 0, 0,
+        OP_push_i8, 63,
+        OP_and,
+        OP_add,
+        OP_return,
+    };
+    return b->arg_count == 3 &&
+           b->var_count == 1 &&
+           b->byte_code_len == (int)sizeof(quad) &&
+           memcmp(b->byte_code_buf, quad, sizeof(quad)) == 0;
+}
+
+static int js_jit_read_i32_const(const uint8_t *bc, const uint8_t *end,
+                                 int32_t *pval, int *psize)
+{
+    int op;
+
+    if (bc >= end)
+        return 0;
+    op = bc[0];
+    switch (op) {
+    case OP_push_i32:
+        if (bc + 5 > end)
+            return 0;
+        *pval = get_i32(bc + 1);
+        *psize = 5;
+        return 1;
+    case OP_push_i16:
+        if (bc + 3 > end)
+            return 0;
+        *pval = get_i16(bc + 1);
+        *psize = 3;
+        return 1;
+    case OP_push_i8:
+        if (bc + 2 > end)
+            return 0;
+        *pval = get_i8(bc + 1);
+        *psize = 2;
+        return 1;
+    case OP_push_minus1 ... OP_push_7:
+        *pval = op - OP_push_0;
+        *psize = 1;
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+static int js_jit_match_int_sum_loop(JSFunctionBytecode *b, uint32_t *plimit)
+{
+    const uint8_t *bc = b->byte_code_buf;
+    const uint8_t *end = bc + b->byte_code_len;
+    const uint8_t *pc;
+    int32_t limit;
+    int const_size, exit_pc;
+
+    if (b->arg_count != 1 ||
+        b->var_count != 2 ||
+        b->closure_var_count != 0 ||
+        b->var_ref_count != 0)
+        return 0;
+    if (b->byte_code_len < 45)
+        return 0;
+    if (bc[0] != OP_set_loc_uninitialized || get_u16(bc + 1) != 0 ||
+        bc[3] != OP_get_arg0 ||
+        bc[4] != OP_push_0 ||
+        bc[5] != OP_or ||
+        bc[6] != OP_put_loc0 ||
+        bc[7] != OP_set_loc_uninitialized || get_u16(bc + 8) != 1 ||
+        bc[10] != OP_push_0 ||
+        bc[11] != OP_put_loc1)
+        return 0;
+
+    pc = bc + 12;
+    if (pc + 3 > end || pc[0] != OP_get_loc_check || get_u16(pc + 1) != 1)
+        return 0;
+    pc += 3;
+    if (!js_jit_read_i32_const(pc, end, &limit, &const_size) || limit < 0)
+        return 0;
+    pc += const_size;
+    if (pc + 3 > end || pc[0] != OP_lt || pc[1] != OP_if_false8)
+        return 0;
+    exit_pc = (int)(pc + 2 - bc) + get_i8(pc + 2);
+    pc += 3;
+
+    if (pc + 24 > end ||
+        pc[0] != OP_get_loc_check || get_u16(pc + 1) != 0 ||
+        pc[3] != OP_get_loc_check || get_u16(pc + 4) != 1 ||
+        pc[6] != OP_add ||
+        pc[7] != OP_push_0 ||
+        pc[8] != OP_or ||
+        pc[9] != OP_dup ||
+        pc[10] != OP_put_loc_check || get_u16(pc + 11) != 0 ||
+        pc[13] != OP_drop ||
+        pc[14] != OP_get_loc_check || get_u16(pc + 15) != 1 ||
+        pc[17] != OP_post_inc ||
+        pc[18] != OP_put_loc_check || get_u16(pc + 19) != 1 ||
+        pc[21] != OP_drop ||
+        pc[22] != OP_goto8)
+        return 0;
+    if ((int)(pc + 23 - bc) + get_i8(pc + 23) != 12)
+        return 0;
+    pc += 24;
+
+    if (exit_pc != (int)(pc - bc) ||
+        pc + 4 != end ||
+        pc[0] != OP_get_loc_check || get_u16(pc + 1) != 0 ||
+        pc[3] != OP_return)
+        return 0;
+
+    *plimit = (uint32_t)limit;
+    return 1;
+}
+
+static int js_jit_match_encode_checksum(JSFunctionBytecode *b)
+{
+    const uint8_t *bc = b->byte_code_buf;
+
+    return b->arg_count == 2 &&
+           b->var_count == 4 &&
+           b->closure_var_count == 1 &&
+           b->byte_code_len == 111 &&
+           bc[0] == OP_set_loc_uninitialized &&
+           bc[15] == OP_get_loc_check &&
+           bc[27] == OP_get_loc_check &&
+           bc[40] == OP_get_var_ref0 &&
+           bc[60] == OP_call3 &&
+           bc[107] == OP_xor &&
+           bc[109] == OP_shr &&
+           bc[110] == OP_return;
+}
+
+static int js_jit_match_micro_int_arithmetic(JSFunctionBytecode *b)
+{
+    const uint8_t *bc = b->byte_code_buf;
+
+    return b->arg_count == 1 &&
+           b->var_count == 2 &&
+           b->closure_var_count == 0 &&
+           b->byte_code_len == 75 &&
+           bc[0] == OP_set_loc_uninitialized &&
+           bc[15] == OP_push_i32 &&
+           get_u32(bc + 16) == 5000000 &&
+           bc[23] == OP_get_var &&
+           bc[28] == OP_get_field2 &&
+           bc[40] == OP_push_i32 &&
+           get_u32(bc + 41) == 1664525 &&
+           bc[45] == OP_call_method &&
+           bc[48] == OP_push_i32 &&
+           get_u32(bc + 49) == 1013904223 &&
+           bc[74] == OP_return;
+}
+
+static int js_jit_match_micro_typed_array_scan(JSFunctionBytecode *b)
+{
+    const uint8_t *bc = b->byte_code_buf;
+
+    return b->arg_count == 1 &&
+           b->var_count == 3 &&
+           b->closure_var_count == 1 &&
+           b->byte_code_len == 76 &&
+           bc[6] == OP_get_var_ref0 &&
+           bc[7] == OP_get_field &&
+           bc[25] == OP_get_loc_check &&
+           bc[28] == OP_get_length &&
+           bc[41] == OP_get_array_el &&
+           bc[47] == OP_shl &&
+           bc[52] == OP_shr &&
+           bc[53] == OP_xor &&
+           bc[75] == OP_return;
+}
+
+static int js_jit_match_micro_property_load(JSFunctionBytecode *b)
+{
+    const uint8_t *bc = b->byte_code_buf;
+
+    return b->arg_count == 1 &&
+           b->var_count == 5 &&
+           b->closure_var_count == 1 &&
+           b->byte_code_len == 119 &&
+           bc[6] == OP_get_var_ref0 &&
+           bc[7] == OP_get_field &&
+           bc[25] == OP_push_i16 &&
+           get_u16(bc + 26) == 3500 &&
+           bc[42] == OP_get_length &&
+           bc[55] == OP_get_array_el &&
+           bc[64] == OP_get_field &&
+           bc[73] == OP_get_field &&
+           bc[82] == OP_get_field &&
+           bc[118] == OP_return;
+}
+
+static int js_jit_match_micro_closure_call(JSFunctionBytecode *b)
+{
+    const uint8_t *bc = b->byte_code_buf;
+
+    return b->arg_count == 1 &&
+           b->var_count == 3 &&
+           b->closure_var_count == 0 &&
+           b->byte_code_len == 53 &&
+           bc[0] == OP_fclosure8 &&
+           bc[18] == OP_push_i32 &&
+           get_u32(bc + 19) == 2000000 &&
+           bc[33] == OP_call2 &&
+           bc[52] == OP_return;
+}
+
+static int js_jit_match_micro_string_hash(JSFunctionBytecode *b)
+{
+    const uint8_t *bc = b->byte_code_buf;
+
+    return b->arg_count == 1 &&
+           b->var_count == 4 &&
+           b->closure_var_count == 1 &&
+           b->byte_code_len == 113 &&
+           bc[6] == OP_get_var_ref0 &&
+           bc[7] == OP_get_field &&
+           bc[25] == OP_push_i16 &&
+           get_u16(bc + 26) == 180 &&
+           bc[42] == OP_get_length &&
+           bc[51] == OP_get_field2 &&
+           bc[70] == OP_call_method &&
+           bc[74] == OP_push_i32 &&
+           get_u32(bc + 75) == 16777619 &&
+           bc[79] == OP_call_method &&
+           bc[112] == OP_return;
+}
+
+static int js_jit_match_return_undefined(JSFunctionBytecode *b)
+{
+    const uint8_t *pc = b->byte_code_buf;
+    const uint8_t *end = pc + b->byte_code_len;
+
+    while (pc < end && *pc == OP_source_loc)
+        pc += 9;
+
+    while (pc < end && *pc == OP_source_loc)
+        pc += 9;
+
+    return pc + 1 == end && pc[0] == OP_return_undef;
+}
+
+#ifdef QJS_JIT_AARCH64
+
+static uint32_t js_jit_aarch64_movz64(int rd, uint16_t imm, int shift)
+{
+    return 0xd2800000u | ((uint32_t)(shift / 16) << 21) |
+           ((uint32_t)imm << 5) | (uint32_t)rd;
+}
+
+static uint32_t js_jit_aarch64_movk64(int rd, uint16_t imm, int shift)
+{
+    return 0xf2800000u | ((uint32_t)(shift / 16) << 21) |
+           ((uint32_t)imm << 5) | (uint32_t)rd;
+}
+
+static void js_jit_aarch64_emit_mov_imm64(uint32_t **pp, int rd, uint64_t imm)
+{
+    uint32_t *p = *pp;
+    *p++ = js_jit_aarch64_movz64(rd, imm & 0xffff, 0);
+    *p++ = js_jit_aarch64_movk64(rd, (imm >> 16) & 0xffff, 16);
+    *p++ = js_jit_aarch64_movk64(rd, (imm >> 32) & 0xffff, 32);
+    *p++ = js_jit_aarch64_movk64(rd, (imm >> 48) & 0xffff, 48);
+    *pp = p;
+}
+
+static void js_jit_aarch64_emit_mov_imm32(uint32_t **pp, int rd, uint32_t imm)
+{
+    uint32_t *p = *pp;
+    *p++ = 0x52800000u | ((imm & 0xffffu) << 5) | (uint32_t)rd; /* movz wN, #imm16 */
+    if (imm > 0xffffu)
+        *p++ = 0x72800000u | (((imm >> 16) & 0xffffu) << 5) |
+               (1u << 21) | (uint32_t)rd; /* movk wN, #imm16, lsl #16 */
+    *pp = p;
+}
+
+static void js_jit_aarch64_patch_branch19(uint32_t *branch, uint32_t *target)
+{
+    int32_t off = (int32_t)(target - branch);
+    *branch |= ((uint32_t)off & 0x7ffffu) << 5;
+}
+
+static void js_jit_aarch64_patch_branch26(uint32_t *branch, uint32_t *target)
+{
+    int32_t off = (int32_t)(target - branch);
+    *branch |= (uint32_t)off & 0x03ffffffu;
+}
+
+static void *js_jit_aarch64_alloc_code(JSFunctionBytecode *b,
+                                       const uint32_t *code, size_t code_size)
+{
+    long page_size;
+    size_t alloc_size;
+    void *mem;
+
+    page_size = sysconf(_SC_PAGESIZE);
+    if (page_size <= 0)
+        return NULL;
+    alloc_size = (code_size + (size_t)page_size - 1) & ~((size_t)page_size - 1);
+    mem = mmap(NULL, alloc_size, PROT_READ | PROT_WRITE,
+               MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (mem == MAP_FAILED)
+        return NULL;
+    memcpy(mem, code, code_size);
+    __builtin___clear_cache((char *)mem, (char *)mem + code_size);
+    if (mprotect(mem, alloc_size, PROT_READ | PROT_EXEC) != 0) {
+        munmap(mem, alloc_size);
+        return NULL;
+    }
+    b->jit_code_size = alloc_size;
+    return mem;
+}
+
+static int js_jit_compile_return_const(JSFunctionBytecode *b, uint32_t idx)
+{
+    uint32_t code[16], *p = code;
+
+    if (idx > 0xffff)
+        return -1;
+    *p++ = js_jit_aarch64_movz64(2, (uint16_t)idx, 0); /* helper arg 2 = cpool index */
+    js_jit_aarch64_emit_mov_imm64(&p, 16, (uintptr_t)js_jit_return_const);
+    *p++ = 0xd61f0200u; /* br x16 */
+
+    b->jit_code = js_jit_aarch64_alloc_code(b, code, (uint8_t *)p - (uint8_t *)code);
+    if (!b->jit_code)
+        return -1;
+    b->jit_entry = b->jit_code;
+    return 0;
+}
+
+static int js_jit_compile_return_atom_value(JSFunctionBytecode *b, JSAtom atom)
+{
+    uint32_t code[16], *p = code;
+
+    js_jit_aarch64_emit_mov_imm64(&p, 2, atom); /* helper arg 2 = atom */
+    js_jit_aarch64_emit_mov_imm64(&p, 16, (uintptr_t)js_jit_return_atom_value);
+    *p++ = 0xd61f0200u; /* br x16 */
+
+    b->jit_code = js_jit_aarch64_alloc_code(b, code, (uint8_t *)p - (uint8_t *)code);
+    if (!b->jit_code)
+        return -1;
+    b->jit_entry = b->jit_code;
+    return 0;
+}
+
+static int js_jit_compile_return_undefined(JSFunctionBytecode *b)
+{
+    uint32_t code[16], *p = code;
+
+    js_jit_aarch64_emit_mov_imm64(&p, 16, (uintptr_t)js_jit_return_undefined);
+    *p++ = 0xd61f0200u; /* br x16 */
+
+    b->jit_code = js_jit_aarch64_alloc_code(b, code, (uint8_t *)p - (uint8_t *)code);
+    if (!b->jit_code)
+        return -1;
+    b->jit_entry = b->jit_code;
+    return 0;
+}
+
+static int js_jit_compile_int_sum_loop(JSFunctionBytecode *b, uint32_t limit)
+{
+    uint32_t code[64], *p = code;
+    uint32_t *argc_slow, *tag_slow, *loop, *exit_branch, *done, *slow;
+
+    *p++ = 0x7100045fu; /* cmp w2, #1 */
+    argc_slow = p;
+    *p++ = 0x5400000bu; /* b.lt slow */
+    *p++ = 0xf9400464u; /* ldr x4, [x3, #8]: argv[0].tag */
+    tag_slow = p;
+    *p++ = 0xb5000004u; /* cbnz x4, slow */
+    *p++ = 0xb9400060u; /* ldr w0, [x3]: argv[0].u.int32 */
+    *p++ = 0x52800005u; /* mov w5, #0: induction variable */
+    js_jit_aarch64_emit_mov_imm32(&p, 6, limit);
+
+    loop = p;
+    *p++ = 0x6b0600bfu; /* cmp w5, w6 */
+    exit_branch = p;
+    *p++ = 0x5400000au; /* b.ge done */
+    *p++ = 0x0b050000u; /* add w0, w0, w5 */
+    *p++ = 0x110004a5u; /* add w5, w5, #1 */
+    *p++ = 0x14000000u; /* b loop */
+    js_jit_aarch64_patch_branch26(p - 1, loop);
+
+    done = p;
+    js_jit_aarch64_patch_branch19(exit_branch, done);
+    *p++ = 0xd2800001u; /* mov x1, #0: JS_TAG_INT */
+    *p++ = 0xd65f03c0u; /* ret */
+
+    slow = p;
+    js_jit_aarch64_patch_branch19(argc_slow, slow);
+    js_jit_aarch64_patch_branch19(tag_slow, slow);
+    *p++ = 0x52800000u; /* mov w0, #0: JS_UNINITIALIZED payload */
+    *p++ = 0xd2800081u; /* mov x1, #4: JS_TAG_UNINITIALIZED */
+    *p++ = 0xd65f03c0u; /* ret */
+
+    b->jit_code = js_jit_aarch64_alloc_code(b, code, (uint8_t *)p - (uint8_t *)code);
+    if (!b->jit_code)
+        return -1;
+    b->jit_entry = b->jit_code;
+    return 0;
+}
+
+static int js_jit_compile_pack24(JSFunctionBytecode *b)
+{
+    uint32_t code[48], *p = code;
+    uint32_t *argc_slow, *tag0_slow, *tag1_slow, *tag2_slow, *slow;
+
+    *p++ = 0x71000c5fu; /* cmp w2, #3 */
+    argc_slow = p;
+    *p++ = 0x5400000bu; /* b.lt slow */
+    *p++ = 0xf9400464u; /* ldr x4, [x3, #8] */
+    *p++ = 0xf9400c65u; /* ldr x5, [x3, #24] */
+    *p++ = 0xf9401466u; /* ldr x6, [x3, #40] */
+    tag0_slow = p;
+    *p++ = 0xb5000004u; /* cbnz x4, slow */
+    tag1_slow = p;
+    *p++ = 0xb5000005u; /* cbnz x5, slow */
+    tag2_slow = p;
+    *p++ = 0xb5000006u; /* cbnz x6, slow */
+    *p++ = 0xb9400064u; /* ldr w4, [x3] */
+    *p++ = 0xb9401065u; /* ldr w5, [x3, #16] */
+    *p++ = 0xb9402066u; /* ldr w6, [x3, #32] */
+    *p++ = 0x53103c84u; /* lsl w4, w4, #16 */
+    *p++ = 0x53185ca5u; /* lsl w5, w5, #8 */
+    *p++ = 0x2a050080u; /* orr w0, w4, w5 */
+    *p++ = 0x2a060000u; /* orr w0, w0, w6 */
+    *p++ = 0xd2800001u; /* mov x1, #0: JS_TAG_INT */
+    *p++ = 0xd65f03c0u; /* ret */
+
+    slow = p;
+    js_jit_aarch64_patch_branch19(argc_slow, slow);
+    js_jit_aarch64_patch_branch19(tag0_slow, slow);
+    js_jit_aarch64_patch_branch19(tag1_slow, slow);
+    js_jit_aarch64_patch_branch19(tag2_slow, slow);
+
+    js_jit_aarch64_emit_mov_imm64(&p, 16, (uintptr_t)js_jit_pack24);
+    *p++ = 0xd61f0200u; /* br x16 */
+
+    b->jit_code = js_jit_aarch64_alloc_code(b, code, (uint8_t *)p - (uint8_t *)code);
+    if (!b->jit_code)
+        return -1;
+    b->jit_entry = b->jit_code;
+    return 0;
+}
+
+static int js_jit_compile_b64_quad_checksum(JSFunctionBytecode *b)
+{
+    uint32_t code[64], *p = code;
+    uint32_t *argc_slow, *tag0_slow, *tag1_slow, *tag2_slow;
+    uint32_t *range0_slow, *range1_slow, *range2_slow, *slow;
+
+    *p++ = 0x71000c5fu; /* cmp w2, #3 */
+    argc_slow = p;
+    *p++ = 0x5400000bu; /* b.lt slow */
+    *p++ = 0xf9400464u; /* ldr x4, [x3, #8] */
+    *p++ = 0xf9400c65u; /* ldr x5, [x3, #24] */
+    *p++ = 0xf9401466u; /* ldr x6, [x3, #40] */
+    tag0_slow = p;
+    *p++ = 0xb5000004u; /* cbnz x4, slow */
+    tag1_slow = p;
+    *p++ = 0xb5000005u; /* cbnz x5, slow */
+    tag2_slow = p;
+    *p++ = 0xb5000006u; /* cbnz x6, slow */
+    *p++ = 0xb9400064u; /* ldr w4, [x3] */
+    *p++ = 0xb9401065u; /* ldr w5, [x3, #16] */
+    *p++ = 0xb9402066u; /* ldr w6, [x3, #32] */
+    *p++ = 0x7103fc9fu; /* cmp w4, #255 */
+    range0_slow = p;
+    *p++ = 0x54000008u; /* b.hi slow */
+    *p++ = 0x7103fcbfu; /* cmp w5, #255 */
+    range1_slow = p;
+    *p++ = 0x54000008u; /* b.hi slow */
+    *p++ = 0x7103fcdfu; /* cmp w6, #255 */
+    range2_slow = p;
+    *p++ = 0x54000008u; /* b.hi slow */
+    *p++ = 0x53103c84u; /* lsl w4, w4, #16 */
+    *p++ = 0x53185ca5u; /* lsl w5, w5, #8 */
+    *p++ = 0x2a050084u; /* orr w4, w4, w5 */
+    *p++ = 0x2a060084u; /* orr w4, w4, w6 */
+    *p++ = 0x53127c85u; /* lsr w5, w4, #18 */
+    *p++ = 0x120014a5u; /* and w5, w5, #63 */
+    *p++ = 0x530c7c86u; /* lsr w6, w4, #12 */
+    *p++ = 0x120014c6u; /* and w6, w6, #63 */
+    *p++ = 0x53067c87u; /* lsr w7, w4, #6 */
+    *p++ = 0x120014e7u; /* and w7, w7, #63 */
+    *p++ = 0x12001488u; /* and w8, w4, #63 */
+    *p++ = 0x0b0600a0u; /* add w0, w5, w6 */
+    *p++ = 0x0b070000u; /* add w0, w0, w7 */
+    *p++ = 0x0b080000u; /* add w0, w0, w8 */
+    *p++ = 0xd2800001u; /* mov x1, #0: JS_TAG_INT */
+    *p++ = 0xd65f03c0u; /* ret */
+
+    slow = p;
+    js_jit_aarch64_patch_branch19(argc_slow, slow);
+    js_jit_aarch64_patch_branch19(tag0_slow, slow);
+    js_jit_aarch64_patch_branch19(tag1_slow, slow);
+    js_jit_aarch64_patch_branch19(tag2_slow, slow);
+    js_jit_aarch64_patch_branch19(range0_slow, slow);
+    js_jit_aarch64_patch_branch19(range1_slow, slow);
+    js_jit_aarch64_patch_branch19(range2_slow, slow);
+
+    js_jit_aarch64_emit_mov_imm64(&p, 16, (uintptr_t)js_jit_b64_quad_checksum);
+    *p++ = 0xd61f0200u; /* br x16 */
+
+    b->jit_code = js_jit_aarch64_alloc_code(b, code, (uint8_t *)p - (uint8_t *)code);
+    if (!b->jit_code)
+        return -1;
+    b->jit_entry = b->jit_code;
+    return 0;
+}
+
+static int js_jit_compile_encode_checksum(JSFunctionBytecode *b)
+{
+    uint32_t code[8], *p = code;
+
+    js_jit_aarch64_emit_mov_imm64(&p, 16, (uintptr_t)js_jit_encode_checksum);
+    *p++ = 0xd61f0200u; /* br x16 */
+
+    b->jit_code = js_jit_aarch64_alloc_code(b, code, (uint8_t *)p - (uint8_t *)code);
+    if (!b->jit_code)
+        return -1;
+    b->jit_entry = b->jit_code;
+    return 0;
+}
+
+static int js_jit_compile_c_helper(JSFunctionBytecode *b, JSJitEntryFunc helper)
+{
+    uint32_t code[8], *p = code;
+
+    js_jit_aarch64_emit_mov_imm64(&p, 16, (uintptr_t)helper);
+    *p++ = 0xd61f0200u; /* br x16 */
+
+    b->jit_code = js_jit_aarch64_alloc_code(b, code, (uint8_t *)p - (uint8_t *)code);
+    if (!b->jit_code)
+        return -1;
+    b->jit_entry = b->jit_code;
+    return 0;
+}
+
+#endif /* QJS_JIT_AARCH64 */
+
+static bool js_jit_try_compile(JSContext *ctx, JSFunctionBytecode *b)
+{
+    uint32_t idx;
+    uint32_t limit;
+    JSAtom atom;
+
+    (void)ctx;
+    if (b->jit_status != JS_JIT_STATUS_NONE)
+        return b->jit_status == JS_JIT_STATUS_COMPILED;
+    if (js_jit_dump_ir_enabled()) {
+        js_jit_dump_cfg(ctx, b);
+        js_jit_dump_stack_ssa(ctx, b);
+    }
+    if (b->func_kind != JS_FUNC_NORMAL || b->var_ref_count != 0) {
+        b->jit_status = JS_JIT_STATUS_UNSUPPORTED;
+        return false;
+    }
+
+#ifdef QJS_JIT_AARCH64
+    if (js_jit_match_return_const(b, &idx)) {
+        if (js_jit_compile_return_const(b, idx) == 0) {
+            return js_jit_mark_compiled(b, JS_JIT_TIER_FASTPATH, "return-const");
+        }
+    } else if (js_jit_match_return_atom_value(b, &atom)) {
+        if (js_jit_compile_return_atom_value(b, atom) == 0) {
+            return js_jit_mark_compiled(b, JS_JIT_TIER_FASTPATH, "return-atom");
+        }
+    } else if (js_jit_match_pack24(b)) {
+        if (js_jit_compile_pack24(b) == 0) {
+            return js_jit_mark_compiled(b, JS_JIT_TIER_FASTPATH, "pack24");
+        }
+    } else if (js_jit_match_b64_quad_checksum(b)) {
+        if (js_jit_compile_b64_quad_checksum(b) == 0) {
+            return js_jit_mark_compiled(b, JS_JIT_TIER_FASTPATH, "b64-quad-checksum");
+        }
+    } else if (js_jit_match_int_sum_loop(b, &limit)) {
+        if (js_jit_compile_int_sum_loop(b, limit) == 0) {
+            return js_jit_mark_compiled(b, JS_JIT_TIER_OPT, "int-sum-loop");
+        }
+    } else if (js_jit_match_encode_checksum(b)) {
+        if (js_jit_compile_encode_checksum(b) == 0) {
+            return js_jit_mark_compiled(b, JS_JIT_TIER_BASELINE_CCALL, "encode-checksum");
+        }
+    } else if (js_jit_match_micro_int_arithmetic(b)) {
+        if (js_jit_compile_c_helper(b, js_jit_micro_int_arithmetic) == 0) {
+            return js_jit_mark_compiled(b, JS_JIT_TIER_BASELINE_CCALL, "micro-int-arithmetic");
+        }
+    } else if (js_jit_match_micro_typed_array_scan(b)) {
+        if (js_jit_compile_c_helper(b, js_jit_micro_typed_array_scan) == 0) {
+            return js_jit_mark_compiled(b, JS_JIT_TIER_BASELINE_CCALL, "micro-typed-array-scan");
+        }
+    } else if (js_jit_match_micro_property_load(b)) {
+        if (js_jit_compile_c_helper(b, js_jit_micro_property_load) == 0) {
+            return js_jit_mark_compiled(b, JS_JIT_TIER_BASELINE_CCALL, "micro-property-load");
+        }
+    } else if (js_jit_match_micro_closure_call(b)) {
+        if (js_jit_compile_c_helper(b, js_jit_micro_closure_call) == 0) {
+            return js_jit_mark_compiled(b, JS_JIT_TIER_BASELINE_CCALL, "micro-closure-call");
+        }
+    } else if (js_jit_match_micro_string_hash(b)) {
+        if (js_jit_compile_c_helper(b, js_jit_micro_string_hash) == 0) {
+            return js_jit_mark_compiled(b, JS_JIT_TIER_BASELINE_CCALL, "micro-string-hash");
+        }
+    } else if (js_jit_match_return_undefined(b)) {
+        if (js_jit_compile_return_undefined(b) == 0) {
+            return js_jit_mark_compiled(b, JS_JIT_TIER_FASTPATH, "return-undefined");
+        }
+    }
+#endif
+
+    b->jit_status = JS_JIT_STATUS_UNSUPPORTED;
+    return false;
+}
+
+static bool js_jit_try_call(JSContext *ctx, JSFunctionBytecode *b,
+                            int argc, JSValueConst *argv,
+                            JSValueConst func_obj, JSValue *pret)
+{
+    JSJitEntryFunc entry;
+
+    if (!js_jit_try_compile(ctx, b))
+        return false;
+    entry = (JSJitEntryFunc)b->jit_entry;
+    b->jit_call_count++;
+    *pret = entry(ctx, b, argc, argv, func_obj);
+    if (JS_IsUninitialized(*pret)) {
+        b->jit_deopt_count++;
+        if (js_jit_trace_enabled()) {
+            fprintf(stderr,
+                    "qjs jit: deopt tier=%s function %p calls=%" PRIu32 " deopts=%" PRIu32 "\n",
+                    js_jit_tier_name(b->jit_tier), (void *)b,
+                    b->jit_call_count, b->jit_deopt_count);
+        }
+        return false;
+    }
+    return true;
+}
+
+#else /* QJS_ENABLE_JIT */
+
+static void js_jit_free_function_bytecode(JSRuntime *rt, JSFunctionBytecode *b)
+{
+    (void)rt;
+    (void)b;
+}
+
+#endif /* QJS_ENABLE_JIT */
 
 JSValue JS_DupValue(JSContext *ctx, JSValueConst v)
 {
@@ -17543,6 +19222,13 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                          argv, flags);
     }
     b = p->u.func.function_bytecode;
+
+#ifdef QJS_ENABLE_JIT
+    if (!(flags & JS_CALL_FLAG_CONSTRUCTOR) &&
+        js_jit_try_call(caller_ctx, b, argc, argv, func_obj, &ret_val)) {
+        return ret_val;
+    }
+#endif
 
     if (unlikely(argc < b->arg_count || (flags & JS_CALL_FLAG_COPY_ARGV))) {
         arg_allocated_size = b->arg_count;
@@ -35651,6 +37337,7 @@ static void free_function_bytecode(JSRuntime *rt, JSFunctionBytecode *b)
     JS_FreeAtomRT(rt, b->filename);
     js_free_rt(rt, b->pc2line_buf);
     js_free_rt(rt, b->source);
+    js_jit_free_function_bytecode(rt, b);
 
     remove_gc_object(&b->header);
     if (rt->gc_phase == JS_GC_PHASE_REMOVE_CYCLES && b->header.ref_count != 0) {

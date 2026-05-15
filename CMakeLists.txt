@@ -40,6 +40,7 @@ xoption(QJS_ENABLE_ASAN "Enable AddressSanitizer (ASan)" OFF)
 xoption(QJS_ENABLE_MSAN "Enable MemorySanitizer (MSan)" OFF)
 xoption(QJS_ENABLE_TSAN "Enable ThreadSanitizer (TSan)" OFF)
 xoption(QJS_ENABLE_UBSAN "Enable UndefinedBehaviorSanitizer (UBSan)" OFF)
+xoption(QJS_ENABLE_JIT "Enable experimental JIT compiler" OFF)
 
 # Used to properly define JS_LIBC_EXTERN.
 add_compile_definitions(QUICKJS_NG_BUILD)
@@ -276,6 +277,9 @@ if(QJS_BUILD_LIBC)
     add_compile_definitions(QJS_BUILD_LIBC)
 endif()
 list(APPEND qjs_defines _GNU_SOURCE)
+if(QJS_ENABLE_JIT)
+    list(APPEND qjs_defines QJS_ENABLE_JIT)
+endif()
 if(WIN32)
     # NB: Windows 7 is EOL and we are only supporting in so far as it doesn't interfere with progress.
     list(APPEND qjs_defines WIN32_LEAN_AND_MEAN _WIN32_WINNT=0x0601)

@@ -159,6 +159,10 @@ qjs_parser = get_option('parser')
 
 qjs_c_args = ['-D_GNU_SOURCE']
 
+if get_option('jit')
+  qjs_c_args += ['-DQJS_ENABLE_JIT']
+endif
+
 if host_system == 'windows'
   qjs_c_args += ['-DWIN32_LEAN_AND_MEAN', '-D_WIN32_WINNT=0x0601']
 endif

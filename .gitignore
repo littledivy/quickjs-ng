@@ -3,6 +3,8 @@
 *.so
 .obj/
 build/
+build-*/
+benchmarks/corpus/
 unicode/
 .idea
 cmake-*

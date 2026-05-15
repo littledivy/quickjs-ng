@@ -63,6 +63,9 @@
 #include <termios.h>
 #include <sys/resource.h>
 #include <sys/wait.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 #include <grp.h>
 #endif
 
@@ -2106,9 +2109,105 @@ static JSValue js_os_isatty(JSContext *ctx, JSValueConst this_val,
     return JS_NewBool(ctx, (isatty(fd) != 0));
 }
 
+#if !defined(_WIN32) && !defined(__wasi__)
+static JSValue js_os_tcpListen(JSContext *ctx, JSValueConst this_val,
+                               int argc, JSValueConst *argv)
+{
+    const char *host = "127.0.0.1";
+    bool host_allocated = false;
+    int port, backlog = 128, fd, err, opt = 1;
+    struct sockaddr_in addr;
+    socklen_t addr_len;
+    JSValue obj;
+
+    if (argc >= 1 && !JS_IsUndefined(argv[0])) {
+        host = JS_ToCString(ctx, argv[0]);
+        if (!host)
+            return JS_EXCEPTION;
+        host_allocated = true;
+    }
+    if (JS_ToInt32(ctx, &port, argv[1])) {
+        if (host_allocated)
+            JS_FreeCString(ctx, host);
+        return JS_EXCEPTION;
+    }
+    if (argc >= 3 && !JS_IsUndefined(argv[2])) {
+        if (JS_ToInt32(ctx, &backlog, argv[2])) {
+            if (host_allocated)
+                JS_FreeCString(ctx, host);
+            return JS_EXCEPTION;
+        }
+    }
+
+    fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) {
+        err = errno;
+        if (host_allocated)
+            JS_FreeCString(ctx, host);
+        return JS_NewInt32(ctx, -err);
+    }
+
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons((uint16_t)port);
+    if (!host || !strcmp(host, "0.0.0.0")) {
+        addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    } else if (inet_pton(AF_INET, host, &addr.sin_addr) != 1) {
+        close(fd);
+        if (host_allocated)
+            JS_FreeCString(ctx, host);
+        return JS_NewInt32(ctx, -EINVAL);
+    }
+    if (host_allocated)
+        JS_FreeCString(ctx, host);
+
+    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0 ||
+        listen(fd, backlog) < 0) {
+        err = errno;
+        close(fd);
+        return JS_NewInt32(ctx, -err);
+    }
+
+    addr_len = sizeof(addr);
+    if (getsockname(fd, (struct sockaddr *)&addr, &addr_len) < 0) {
+        err = errno;
+        close(fd);
+        return JS_NewInt32(ctx, -err);
+    }
+
+    obj = JS_NewObject(ctx);
+    if (JS_IsException(obj)) {
+        close(fd);
+        return JS_EXCEPTION;
+    }
+    JS_SetPropertyStr(ctx, obj, "fd", JS_NewInt32(ctx, fd));
+    JS_SetPropertyStr(ctx, obj, "port", JS_NewInt32(ctx, ntohs(addr.sin_port)));
+    return obj;
+}
+
+static JSValue js_os_accept(JSContext *ctx, JSValueConst this_val,
+                            int argc, JSValueConst *argv)
+{
+    int fd, ret;
+
+    if (JS_ToInt32(ctx, &fd, argv[0]))
+        return JS_EXCEPTION;
+    ret = accept(fd, NULL, NULL);
+#ifdef SO_NOSIGPIPE
+    if (ret >= 0) {
+        int opt = 1;
+        setsockopt(ret, SOL_SOCKET, SO_NOSIGPIPE, &opt, sizeof(opt));
+    }
+#endif
+    return JS_NewInt32(ctx, js_get_errno(ret));
+}
+#endif
+
 #if defined(_WIN32)
 static JSValue js_os_ttyGetWinSize(JSContext *ctx, JSValueConst this_val,
-                                   int argc, JSValueConst *argv)
+                                    int argc, JSValueConst *argv)
 {
     int fd;
     HANDLE handle;
@@ -4409,6 +4508,10 @@ static const JSCFunctionListEntry js_os_funcs[] = {
     JS_CFUNC_MAGIC_DEF("read", 4, js_os_read_write, 0 ),
     JS_CFUNC_MAGIC_DEF("write", 4, js_os_read_write, 1 ),
     JS_CFUNC_DEF("isatty", 1, js_os_isatty ),
+#if !defined(_WIN32) && !defined(__wasi__)
+    JS_CFUNC_DEF("tcpListen", 2, js_os_tcpListen ),
+    JS_CFUNC_DEF("accept", 1, js_os_accept ),
+#endif
 #if !defined(__wasi__)
     JS_CFUNC_DEF("ttyGetWinSize", 1, js_os_ttyGetWinSize ),
     JS_CFUNC_DEF("ttySetRaw", 1, js_os_ttySetRaw ),
